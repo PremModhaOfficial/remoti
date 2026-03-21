@@ -15,3 +15,14 @@ type Executor interface {
 	// Close cleans up the executor resources.
 	Close() error
 }
+
+// MouseExecutor defines the interface for mouse/touchpad input.
+type MouseExecutor interface {
+	MoveTo(x, y int32) error
+	LeftClick(x, y int32) error
+	RightClick(x, y int32) error
+	MiddleClick(x, y int32) error
+	MouseDown(x, y int32, button string) error
+	MouseUp(button string) error
+	Scroll(dx, dy int32) error
+}

@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"log"
-	"os"
 
 	"remoti/pkg/executor"
 	"remoti/pkg/protocol"
@@ -12,15 +11,17 @@ import (
 
 func main() {
 	var addr string
-	flag.StringVar(&addr, "addr", ":8080", "Address to listen on (e.g., :8080)")
+	var screenWidth, screenHeight int
+	flag.StringVar(&addr, "addr", "127.0.0.1:8080", "Address to listen on (e.g., 127.0.0.1:8080)")
+	flag.IntVar(&screenWidth, "screen-width", 1920, "Screen width in pixels for mouse input")
+	flag.IntVar(&screenHeight, "screen-height", 1080, "Screen height in pixels for mouse input")
 	flag.Parse()
 
 	// 1. Initialize Executor (Linux uinput)
 	log.Println("Initializing uinput executor...")
-	exec, err := executor.NewLinuxExecutor()
+	exec, err := executor.NewLinuxExecutor(int32(screenWidth), int32(screenHeight))
 	if err != nil {
 		log.Fatalf("Failed to initialize executor: %v\nNote: uinput requires root privileges. Try running with sudo.", err)
-		os.Exit(1)
 	}
 	defer exec.Close()
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"remoti/pkg/executor"
@@ -31,6 +32,9 @@ func NewTextParser() Parser {
 // ParseStream reads the stream line-by-line and triggers the executor.
 func (p *textParser) ParseStream(r io.Reader, exec executor.Executor) error {
 	scanner := bufio.NewScanner(r)
+
+	// Type-assert once for mouse support
+	mouseExec, hasMouseSupport := exec.(executor.MouseExecutor)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -94,10 +98,118 @@ func (p *textParser) ParseStream(r io.Reader, exec executor.Executor) error {
 			if err := exec.Reset(); err != nil {
 				return err
 			}
+		case 'P':
+			// Heartbeat/ping — no-op, used by clients to check connection
+			continue
+		case 'M':
+			if !hasMouseSupport {
+				return fmt.Errorf("%w: mouse commands not supported by executor", ErrUnknownCommand)
+			}
+			if err := parseMouseCommand(string(line), mouseExec); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("%w: %c", ErrUnknownCommand, cmd)
 		}
 	}
 
 	return scanner.Err()
+}
+
+// parseMouseCommand handles M sub-commands.
+// Format: M <sub> [args...]
+func parseMouseCommand(line string, mouse executor.MouseExecutor) error {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return fmt.Errorf("%w: missing mouse sub-command", ErrMissingArgument)
+	}
+
+	sub := fields[1]
+	switch sub {
+	case "M": // M M <x> <y> — move
+		if len(fields) < 4 {
+			return fmt.Errorf("%w: M M requires <x> <y>", ErrMissingArgument)
+		}
+		x, y, err := parseCoords(fields[2], fields[3])
+		if err != nil {
+			return err
+		}
+		return mouse.MoveTo(x, y)
+
+	case "C": // M C <x> <y> — left click
+		if len(fields) < 4 {
+			return fmt.Errorf("%w: M C requires <x> <y>", ErrMissingArgument)
+		}
+		x, y, err := parseCoords(fields[2], fields[3])
+		if err != nil {
+			return err
+		}
+		return mouse.LeftClick(x, y)
+
+	case "R": // M R <x> <y> — right click
+		if len(fields) < 4 {
+			return fmt.Errorf("%w: M R requires <x> <y>", ErrMissingArgument)
+		}
+		x, y, err := parseCoords(fields[2], fields[3])
+		if err != nil {
+			return err
+		}
+		return mouse.RightClick(x, y)
+
+	case "K": // M K <x> <y> — middle click
+		if len(fields) < 4 {
+			return fmt.Errorf("%w: M K requires <x> <y>", ErrMissingArgument)
+		}
+		x, y, err := parseCoords(fields[2], fields[3])
+		if err != nil {
+			return err
+		}
+		return mouse.MiddleClick(x, y)
+
+	case "D": // M D <x> <y> [button] — mouse down
+		if len(fields) < 4 {
+			return fmt.Errorf("%w: M D requires <x> <y>", ErrMissingArgument)
+		}
+		x, y, err := parseCoords(fields[2], fields[3])
+		if err != nil {
+			return err
+		}
+		button := "left"
+		if len(fields) >= 5 {
+			button = fields[4]
+		}
+		return mouse.MouseDown(x, y, button)
+
+	case "U": // M U [button] — mouse up
+		button := "left"
+		if len(fields) >= 3 {
+			button = fields[2]
+		}
+		return mouse.MouseUp(button)
+
+	case "S": // M S <dx> <dy> — scroll
+		if len(fields) < 4 {
+			return fmt.Errorf("%w: M S requires <dx> <dy>", ErrMissingArgument)
+		}
+		dx, dy, err := parseCoords(fields[2], fields[3])
+		if err != nil {
+			return err
+		}
+		return mouse.Scroll(dx, dy)
+
+	default:
+		return fmt.Errorf("%w: unknown mouse sub-command: %s", ErrUnknownCommand, sub)
+	}
+}
+
+func parseCoords(xs, ys string) (int32, int32, error) {
+	x, err := strconv.ParseInt(xs, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid x coordinate %q: %w", xs, err)
+	}
+	y, err := strconv.ParseInt(ys, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid y coordinate %q: %w", ys, err)
+	}
+	return int32(x), int32(y), nil
 }

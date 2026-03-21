@@ -1,49 +1,80 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/bendahl/uinput"
 )
 
-// LinuxExecutor implements the Executor interface using /dev/uinput.
+// LinuxExecutor implements the Executor and MouseExecutor interfaces using /dev/uinput.
 type LinuxExecutor struct {
-	vkb     uinput.Keyboard
-	pressed map[int]bool // keep track of down keys to reset them
+	mu             sync.Mutex
+	vkb            uinput.Keyboard
+	tp             uinput.TouchPad
+	pressed        map[int]bool // keep track of down keys to reset them
+	buttonsPressed map[int]bool // keep track of down mouse buttons to reset them
 }
 
 // NewLinuxExecutor creates a new Executor backed by /dev/uinput.
-func NewLinuxExecutor() (*LinuxExecutor, error) {
+func NewLinuxExecutor(screenWidth, screenHeight int32) (*LinuxExecutor, error) {
 	vkb, err := uinput.CreateKeyboard("/dev/uinput", []byte("Remoti Virtual Keyboard"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create virtual keyboard: %w", err)
 	}
 
+	tp, err := uinput.CreateTouchPad("/dev/uinput", []byte("Remoti Virtual TouchPad"), 0, screenWidth, 0, screenHeight)
+	if err != nil {
+		vkb.Close()
+		return nil, fmt.Errorf("failed to create virtual touchpad: %w", err)
+	}
+
 	return &LinuxExecutor{
-		vkb:     vkb,
-		pressed: make(map[int]bool),
+		vkb:            vkb,
+		tp:             tp,
+		pressed:        make(map[int]bool),
+		buttonsPressed: make(map[int]bool),
 	}, nil
 }
 
-// Close closes the virtual keyboard and releases any resources.
+// Close closes the virtual devices and releases any resources.
 func (e *LinuxExecutor) Close() error {
-	e.Reset()
-	return e.vkb.Close()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.resetLocked()
+
+	var errs []error
+	if err := e.vkb.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("keyboard close: %w", err))
+	}
+	if err := e.tp.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("touchpad close: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func (e *LinuxExecutor) Type(text string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	for _, char := range text {
 		keyCode, shift := runeToKey(char)
 
 		if shift {
-			e.vkb.KeyDown(uinput.KeyLeftshift)
+			if err := e.vkb.KeyDown(uinput.KeyLeftshift); err != nil {
+				return fmt.Errorf("shift key down: %w", err)
+			}
 		}
 
 		err := e.vkb.KeyPress(keyCode)
 
 		if shift {
-			e.vkb.KeyUp(uinput.KeyLeftshift)
+			if upErr := e.vkb.KeyUp(uinput.KeyLeftshift); upErr != nil && err == nil {
+				err = fmt.Errorf("shift key up: %w", upErr)
+			}
 		}
 
 		if err != nil {
@@ -54,6 +85,9 @@ func (e *LinuxExecutor) Type(text string) error {
 }
 
 func (e *LinuxExecutor) Combo(keys ...string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	keyCodes := make([]int, 0, len(keys))
 	for _, k := range keys {
 		kc, err := parseKeyName(k)
@@ -70,14 +104,20 @@ func (e *LinuxExecutor) Combo(keys ...string) error {
 		}
 	}
 
-	// Release all in reverse order
+	// Release all in reverse order, collecting errors
+	var errs []error
 	for i := len(keyCodes) - 1; i >= 0; i-- {
-		e.vkb.KeyUp(keyCodes[i])
+		if err := e.vkb.KeyUp(keyCodes[i]); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (e *LinuxExecutor) KeyDown(key string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	kc, err := parseKeyName(key)
 	if err != nil {
 		return err
@@ -87,6 +127,9 @@ func (e *LinuxExecutor) KeyDown(key string) error {
 }
 
 func (e *LinuxExecutor) KeyUp(key string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	kc, err := parseKeyName(key)
 	if err != nil {
 		return err
@@ -96,11 +139,144 @@ func (e *LinuxExecutor) KeyUp(key string) error {
 }
 
 func (e *LinuxExecutor) Reset() error {
-	for kc := range e.pressed {
-		e.vkb.KeyUp(kc)
-		delete(e.pressed, kc)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.resetLocked()
+}
+
+// resetLocked releases all held keys and mouse buttons. Must be called with mu held.
+func (e *LinuxExecutor) resetLocked() error {
+	var errs []error
+
+	// Release keyboard keys — replace map instead of deleting during iteration
+	old := e.pressed
+	e.pressed = make(map[int]bool)
+	for kc := range old {
+		if err := e.vkb.KeyUp(kc); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+
+	// Release mouse buttons
+	oldButtons := e.buttonsPressed
+	e.buttonsPressed = make(map[int]bool)
+	for btn := range oldButtons {
+		if err := e.releaseMouseButton(btn); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// Mouse button constants for internal tracking.
+const (
+	mouseButtonLeft   = 0
+	mouseButtonRight  = 1
+	mouseButtonMiddle = 2
+)
+
+func parseMouseButton(button string) (int, error) {
+	switch strings.ToLower(button) {
+	case "left", "":
+		return mouseButtonLeft, nil
+	case "right":
+		return mouseButtonRight, nil
+	case "middle":
+		return mouseButtonMiddle, nil
+	default:
+		return 0, fmt.Errorf("unknown mouse button: %s", button)
+	}
+}
+
+func (e *LinuxExecutor) pressMouseButton(btn int) error {
+	switch btn {
+	case mouseButtonLeft:
+		return e.tp.LeftPress()
+	case mouseButtonRight:
+		return e.tp.RightPress()
+	case mouseButtonMiddle:
+		return fmt.Errorf("middle click not supported by touchpad device")
+	}
+	return fmt.Errorf("unknown mouse button id: %d", btn)
+}
+
+func (e *LinuxExecutor) releaseMouseButton(btn int) error {
+	switch btn {
+	case mouseButtonLeft:
+		return e.tp.LeftRelease()
+	case mouseButtonRight:
+		return e.tp.RightRelease()
+	case mouseButtonMiddle:
+		return fmt.Errorf("middle click not supported by touchpad device")
+	}
+	return fmt.Errorf("unknown mouse button id: %d", btn)
+}
+
+func (e *LinuxExecutor) MoveTo(x, y int32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.tp.MoveTo(x, y)
+}
+
+func (e *LinuxExecutor) LeftClick(x, y int32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.tp.MoveTo(x, y); err != nil {
+		return err
+	}
+	return e.tp.LeftClick()
+}
+
+func (e *LinuxExecutor) RightClick(x, y int32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.tp.MoveTo(x, y); err != nil {
+		return err
+	}
+	return e.tp.RightClick()
+}
+
+func (e *LinuxExecutor) MiddleClick(x, y int32) error {
+	return fmt.Errorf("middle click not supported by touchpad device")
+}
+
+func (e *LinuxExecutor) MouseDown(x, y int32, button string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	btn, err := parseMouseButton(button)
+	if err != nil {
+		return err
+	}
+
+	if err := e.tp.MoveTo(x, y); err != nil {
+		return err
+	}
+
+	e.buttonsPressed[btn] = true
+	return e.pressMouseButton(btn)
+}
+
+func (e *LinuxExecutor) MouseUp(button string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	btn, err := parseMouseButton(button)
+	if err != nil {
+		return err
+	}
+
+	delete(e.buttonsPressed, btn)
+	return e.releaseMouseButton(btn)
+}
+
+func (e *LinuxExecutor) Scroll(dx, dy int32) error {
+	return fmt.Errorf("scroll not yet implemented: touchpad device does not support scroll events")
 }
 
 // Helper to parse key names into uinput key codes
