@@ -1,0 +1,27 @@
+[env]
+# Environment variables for the project
+CGO_ENABLED = "1"
+
+[tools]
+# Specify Go version
+go = "1.26.1"
+
+[tasks.build]
+description = "Build the remoti server binary"
+run = "go build -o remoti ./cmd/remoti"
+
+[tasks.run]
+description = "Run the remoti server (requires root for uinput)"
+run = "sudo ./remoti"
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks.tidy]
+description = "Tidy Go modules"
+run = "go mod tidy"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "rm -f remoti"
