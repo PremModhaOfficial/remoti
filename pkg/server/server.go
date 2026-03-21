@@ -42,6 +42,10 @@ func (s *Server) Start() error {
 			continue
 		}
 
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetNoDelay(true)
+		}
+
 		go s.handleConnection(conn)
 	}
 }

@@ -60,13 +60,23 @@ pub fn Grid(
         pub const SECTION_BYTES = section_bytes;
         pub const OFFSETS = offsets;
 
-        /// Hash a single section using Zig's std XxHash64.
-        /// Uses comptime offset — no multiply at runtime.
+        /// Hash a single section using Zig's XxHash3 (SIMD @Vector(8,u64)).
+        /// Uses comptime offset — no multiply at runtime for the base address.
         pub fn hashSection(pix: [*]const u8, section_idx: u32) u64 {
             const base = OFFSETS[section_idx];
+            var h = std.hash.XxHash3.init(0);
+            var row: u32 = 0;
+            while (row < SEC_H) : (row += 1) {
+                const off = base + row * STRIDE;
+                h.update(pix[off .. off + SECTION_BYTES]);
+            }
+            return h.final();
+        }
+
+        /// Single-section hash with XxHash64 (for comparison).
+        pub fn hashSection64(pix: [*]const u8, section_idx: u32) u64 {
+            const base = OFFSETS[section_idx];
             var h = std.hash.XxHash64.init(0);
-            // Runtime loop over rows — SEC_H rows per section (120 for 1080p).
-            // This stays as a normal loop; the compiler will vectorize/unroll it.
             var row: u32 = 0;
             while (row < SEC_H) : (row += 1) {
                 const off = base + row * STRIDE;
@@ -94,16 +104,17 @@ pub fn Grid(
             return false;
         }
 
-        /// Hash-based diff. Iterates over SECTION_COUNT sections.
-        /// Section loop is unrolled via inline for; row loop stays runtime
-        /// to avoid massive code size explosion (144 * 120 = 17280 blocks).
+        /// Hash-based diff. Runtime loop over sections — keeps code size small
+        /// so the hot path stays in i-cache. The inner hash loop (per-row) is
+        /// where the work is, not the section dispatch.
         pub fn diff(
             pix: [*]const u8,
             prev_hashes: *[SECTION_COUNT]u64,
             dirty_out: [*]u32,
         ) u32 {
             var dirty_count: u32 = 0;
-            inline for (0..SECTION_COUNT) |i| {
+            var i: u32 = 0;
+            while (i < SECTION_COUNT) : (i += 1) {
                 const h = hashSection(pix, i);
                 if (h != prev_hashes[i]) {
                     dirty_out[dirty_count] = i;
@@ -250,7 +261,7 @@ pub fn main() !void {
 
     if (!do_bench) return;
 
-    const iterations: u64 = 50_000;
+    const iterations: u64 = 5_000;
 
     // --- Bench 1: steady-state hash diff (identical frames, 0 dirty) ---
     // Prime once, then repeatedly diff pix_a vs itself (no changes).
@@ -263,15 +274,19 @@ pub fn main() !void {
     }
     const hash_static_ns = t0.read();
 
-    // --- Bench 2: steady-state hash diff (1 dirty section) ---
+    // --- Bench 2: steady-state hash diff (1 dirty section alternating) ---
+    // Alternate between pix_a and pix_b so section 35 is always dirty.
+    // Each iteration is exactly one griddiff_update call.
     griddiff_reset(&state);
     _ = griddiff_update(&state, pix_a.ptr, &dirty_buf, true);
     t0 = try std.time.Timer.start();
     i = 0;
     while (i < iterations) : (i += 1) {
-        griddiff_reset(&state);
-        _ = griddiff_update(&state, pix_a.ptr, &dirty_buf, true);
-        _ = griddiff_update(&state, pix_b.ptr, &dirty_buf, false);
+        if (i % 2 == 0) {
+            _ = griddiff_update(&state, pix_b.ptr, &dirty_buf, false);
+        } else {
+            _ = griddiff_update(&state, pix_a.ptr, &dirty_buf, false);
+        }
     }
     const hash_1dirty_ns = t0.read();
 
@@ -303,4 +318,28 @@ pub fn main() !void {
     try stdout.print("Eq diff   (0 dirty / static):  {d:.2}µs/op\n", .{ns_per(eq_static_ns, iterations)});
     try stdout.print("Eq diff   (1 dirty section):   {d:.2}µs/op\n", .{ns_per(eq_1dirty_ns, iterations)});
     try stdout.print("\nGo baseline (from Go bench): ~500µs/op (hash, 16x9 1080p, 9 goroutines)\n", .{});
+
+    // --- Bench 5: single section hash (XxHash3) ---
+    t0 = try std.time.Timer.start();
+    i = 0;
+    var sink: u64 = 0;
+    while (i < iterations * 100) : (i += 1) {
+        sink +%= Grid1080p.hashSection(pix_a.ptr, 0);
+    }
+    const sec_hash3_ns = t0.read();
+    _ = sink;
+
+    // --- Bench 6: single section hash (XxHash64) ---
+    t0 = try std.time.Timer.start();
+    i = 0;
+    var sink2: u64 = 0;
+    while (i < iterations * 100) : (i += 1) {
+        sink2 +%= Grid1080p.hashSection64(pix_a.ptr, 0);
+    }
+    const sec_hash64_ns = t0.read();
+    _ = sink2;
+
+    const sec_iters = iterations * 100;
+    try stdout.print("\nPer-section hash (XxHash3):  {d:.3}µs  [Go BenchmarkHashSection ~7µs]\n", .{ns_per(sec_hash3_ns, sec_iters)});
+    try stdout.print("Per-section hash (XxHash64): {d:.3}µs\n", .{ns_per(sec_hash64_ns, sec_iters)});
 }

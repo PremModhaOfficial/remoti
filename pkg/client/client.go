@@ -32,6 +32,10 @@ func Connect(address string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("remoti: failed to connect to %s: %w", address, err)
 	}
 
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
 	return &Client{
 		addr:   address,
 		opts:   o,
