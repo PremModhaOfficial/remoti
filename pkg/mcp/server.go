@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os/exec"
+	"time"
 
 	"remoti/pkg/client"
 	"remoti/pkg/eye"
@@ -122,6 +125,18 @@ func (s *Server) registerTools() {
 	s.mcp.AddTool(gomcp.NewTool("windows",
 		gomcp.WithDescription("List all open windows with their IDs, titles, and app IDs"),
 	), s.handleWindows)
+
+	// Window management
+	s.mcp.AddTool(gomcp.NewTool("focus",
+		gomcp.WithDescription("Focus a window by app ID or title substring. Use before typing/clicking in that window."),
+		gomcp.WithString("app", gomcp.Description("App ID substring (e.g. 'zen', 'wezterm', 'ghostty')")),
+		gomcp.WithString("title", gomcp.Description("Window title substring")),
+	), s.handleFocus)
+
+	s.mcp.AddTool(gomcp.NewTool("browse",
+		gomcp.WithDescription("Focus the browser, open a new tab, and navigate to a URL. Handles focus switching automatically."),
+		gomcp.WithString("url", gomcp.Required(), gomcp.Description("URL to navigate to")),
+	), s.handleBrowse)
 
 	// Utility
 	s.mcp.AddTool(gomcp.NewTool("ping",
@@ -302,6 +317,86 @@ func (s *Server) handleWindows(ctx context.Context, req gomcp.CallToolRequest) (
 			i, e.Name(), e.AppID(), b.X, b.Y, b.Width, b.Height)
 	}
 	return gomcp.NewToolResultText(result), nil
+}
+
+// Window management handlers
+
+func (s *Server) handleFocus(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	app := req.GetString("app", "")
+	title := req.GetString("title", "")
+	if app == "" && title == "" {
+		return gomcp.NewToolResultError("at least one of app or title is required"), nil
+	}
+	windowID, name, err := focusWindowByMatch(ctx, app, title)
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("focus failed: %v", err)), nil
+	}
+	return gomcp.NewToolResultText(fmt.Sprintf("focused window %d: %s", windowID, name)), nil
+}
+
+func (s *Server) handleBrowse(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	url, err := req.RequireString("url")
+	if err != nil {
+		return gomcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Find and focus the browser window
+	_, name, err := focusWindowByMatch(ctx, "zen", "")
+	if err != nil {
+		// Try firefox as fallback
+		_, name, err = focusWindowByMatch(ctx, "firefox", "")
+		if err != nil {
+			return gomcp.NewToolResultError(fmt.Sprintf("no browser window found: %v", err)), nil
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // wait for focus
+
+	// Open new tab
+	if err := s.client.Combo("ctrl", "t"); err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("ctrl+t failed: %v", err)), nil
+	}
+	time.Sleep(300 * time.Millisecond) // wait for new tab
+
+	// Type URL and navigate
+	if err := s.client.Type(url); err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("type url failed: %v", err)), nil
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := s.client.Combo("enter"); err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("enter failed: %v", err)), nil
+	}
+
+	return gomcp.NewToolResultText(fmt.Sprintf("navigated to %s in %s", url, name)), nil
+}
+
+// focusWindowByMatch finds a window by app/title and focuses it via niri IPC.
+func focusWindowByMatch(ctx context.Context, app, title string) (int, string, error) {
+	out, err := exec.CommandContext(ctx, "niri", "msg", "-j", "windows").Output()
+	if err != nil {
+		return 0, "", fmt.Errorf("niri windows: %w", err)
+	}
+
+	var windows []struct {
+		ID    int    `json:"id"`
+		Title string `json:"title"`
+		AppID string `json:"app_id"`
+	}
+	if err := json.Unmarshal(out, &windows); err != nil {
+		return 0, "", err
+	}
+
+	for _, w := range windows {
+		appMatch := app != "" && containsLower(w.AppID, app)
+		titleMatch := title != "" && containsLower(w.Title, title)
+		if appMatch || titleMatch {
+			err := exec.CommandContext(ctx, "niri", "msg", "action", "focus-window", "--id", fmt.Sprintf("%d", w.ID)).Run()
+			if err != nil {
+				return 0, "", fmt.Errorf("focus window %d: %w", w.ID, err)
+			}
+			return w.ID, w.Title, nil
+		}
+	}
+	return 0, "", fmt.Errorf("no window matching app=%q title=%q", app, title)
 }
 
 // Utility handlers

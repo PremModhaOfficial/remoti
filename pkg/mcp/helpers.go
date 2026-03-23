@@ -16,6 +16,11 @@ func splitCombo(keys string) []string {
 	return parts
 }
 
+// containsLower checks if s contains substr (case-insensitive).
+func containsLower(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
 // requireCoords extracts x,y from a tool request.
 func requireCoords(req gomcp.CallToolRequest) (int32, int32, error) {
 	x, err := req.RequireFloat("x")
