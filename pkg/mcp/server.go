@@ -2,10 +2,12 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
+	"strings"
 	"time"
 
 	"remoti/pkg/client"
@@ -137,6 +139,58 @@ func (s *Server) registerTools() {
 		gomcp.WithDescription("Focus the browser, open a new tab, and navigate to a URL. Handles focus switching automatically."),
 		gomcp.WithString("url", gomcp.Required(), gomcp.Description("URL to navigate to")),
 	), s.handleBrowse)
+
+	// Wait / polling
+	s.mcp.AddTool(gomcp.NewTool("wait_for",
+		gomcp.WithDescription("Wait for a window/text condition. Polls until condition met or timeout."),
+		gomcp.WithString("window_title", gomcp.Description("Wait until a window with this title substring exists")),
+		gomcp.WithString("window_app", gomcp.Description("Wait until a window with this app ID exists")),
+		gomcp.WithString("tmux_text", gomcp.Description("Wait until this text appears in the active tmux pane")),
+		gomcp.WithString("tmux_target", gomcp.Description("Tmux target pane (default: current)")),
+		gomcp.WithNumber("timeout", gomcp.Description("Timeout in seconds (default 10)")),
+	), s.handleWaitFor)
+
+	s.mcp.AddTool(gomcp.NewTool("tmux_capture",
+		gomcp.WithDescription("Capture the text content of a tmux pane. Fast alternative to screenshots for terminal verification."),
+		gomcp.WithString("target", gomcp.Description("Tmux target (session:window.pane). Default: active pane")),
+		gomcp.WithNumber("lines", gomcp.Description("Number of history lines to capture (default 50)")),
+	), s.handleTmuxCapture)
+
+	s.mcp.AddTool(gomcp.NewTool("tmux_send",
+		gomcp.WithDescription("Send keys or text to a tmux pane. Works regardless of window focus — uses PTY write, not keyboard injection."),
+		gomcp.WithString("text", gomcp.Description("Text to send to the pane")),
+		gomcp.WithString("keys", gomcp.Description("Special keys like Enter, Tab, Escape, C-c, C-d, Up, Down")),
+		gomcp.WithString("target", gomcp.Description("Tmux target (session:window.pane). Default: active pane")),
+	), s.handleTmuxSend)
+
+	s.mcp.AddTool(gomcp.NewTool("tmux_list",
+		gomcp.WithDescription("List tmux sessions, windows, and panes with their content preview"),
+	), s.handleTmuxList)
+
+	// Niri compositor tools
+	s.mcp.AddTool(gomcp.NewTool("niri_action",
+		gomcp.WithDescription("Execute a niri compositor action: switch workspace, move window, toggle fullscreen, etc."),
+		gomcp.WithString("action", gomcp.Required(), gomcp.Description("Action: focus-workspace-N, move-window-to-workspace-N, fullscreen, maximize, close-window, switch-preset-column-width, screenshot")),
+	), s.handleNiriAction)
+
+	s.mcp.AddTool(gomcp.NewTool("spawn",
+		gomcp.WithDescription("Launch an application by command name"),
+		gomcp.WithString("command", gomcp.Required(), gomcp.Description("Command to execute (e.g. 'ghostty', 'zen-browser', 'nautilus')")),
+	), s.handleSpawn)
+
+	// Screenshot
+	s.mcp.AddTool(gomcp.NewTool("screenshot",
+		gomcp.WithDescription("Take a screenshot of the screen. Returns the image for visual analysis."),
+		gomcp.WithNumber("scale", gomcp.Description("Scale factor 0.1-1.0 (default 0.5 for speed)")),
+	), s.handleScreenshot)
+
+	s.mcp.AddTool(gomcp.NewTool("screenshot_region",
+		gomcp.WithDescription("Take a screenshot of a specific screen region"),
+		gomcp.WithNumber("x", gomcp.Required(), gomcp.Description("X coordinate")),
+		gomcp.WithNumber("y", gomcp.Required(), gomcp.Description("Y coordinate")),
+		gomcp.WithNumber("width", gomcp.Required(), gomcp.Description("Width")),
+		gomcp.WithNumber("height", gomcp.Required(), gomcp.Description("Height")),
+	), s.handleScreenshotRegion)
 
 	// Utility
 	s.mcp.AddTool(gomcp.NewTool("ping",
@@ -397,6 +451,230 @@ func focusWindowByMatch(ctx context.Context, app, title string) (int, string, er
 		}
 	}
 	return 0, "", fmt.Errorf("no window matching app=%q title=%q", app, title)
+}
+
+// Wait / polling handlers
+
+func (s *Server) handleWaitFor(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	windowTitle := req.GetString("window_title", "")
+	windowApp := req.GetString("window_app", "")
+	tmuxText := req.GetString("tmux_text", "")
+	tmuxTarget := req.GetString("tmux_target", "")
+	timeoutSec := req.GetFloat("timeout", 10)
+
+	if windowTitle == "" && windowApp == "" && tmuxText == "" {
+		return gomcp.NewToolResultError("at least one of window_title, window_app, or tmux_text is required"), nil
+	}
+
+	deadline := time.Now().Add(time.Duration(timeoutSec * float64(time.Second)))
+	for {
+		// Check window conditions via niri IPC.
+		if windowTitle != "" || windowApp != "" {
+			out, err := exec.CommandContext(ctx, "niri", "msg", "-j", "windows").Output()
+			if err == nil {
+				var windows []struct {
+					ID    int    `json:"id"`
+					Title string `json:"title"`
+					AppID string `json:"app_id"`
+				}
+				if json.Unmarshal(out, &windows) == nil {
+					for _, w := range windows {
+						titleOK := windowTitle == "" || containsLower(w.Title, windowTitle)
+						appOK := windowApp == "" || containsLower(w.AppID, windowApp)
+						if titleOK && appOK {
+							return gomcp.NewToolResultText(fmt.Sprintf(
+								"condition met: window id=%d title=%q app=%s", w.ID, w.Title, w.AppID,
+							)), nil
+						}
+					}
+				}
+			}
+		}
+
+		// Check tmux pane content.
+		if tmuxText != "" {
+			target := tmuxTarget
+			if target == "" {
+				raw, err := exec.CommandContext(ctx, "tmux", "display-message", "-p",
+					"#{session_name}:#{window_index}.#{pane_index}").Output()
+				if err == nil {
+					target = strings.TrimSpace(string(raw))
+				}
+			}
+			args := []string{"capture-pane", "-p"}
+			if target != "" {
+				args = append(args, "-t", target)
+			}
+			out, err := exec.CommandContext(ctx, "tmux", args...).Output()
+			if err == nil && strings.Contains(string(out), tmuxText) {
+				return gomcp.NewToolResultText(fmt.Sprintf(
+					"condition met: text %q found in tmux pane %s", tmuxText, target,
+				)), nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return gomcp.NewToolResultError(fmt.Sprintf(
+				"timeout after %.0fs: condition not met (window_title=%q window_app=%q tmux_text=%q)",
+				timeoutSec, windowTitle, windowApp, tmuxText,
+			)), nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func (s *Server) handleTmuxCapture(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	target := req.GetString("target", "")
+	lines := int(req.GetFloat("lines", 50))
+
+	if target == "" {
+		raw, err := exec.CommandContext(ctx, "tmux", "display-message", "-p",
+			"#{session_name}:#{window_index}.#{pane_index}").Output()
+		if err != nil {
+			return gomcp.NewToolResultError(fmt.Sprintf("tmux display-message failed: %v", err)), nil
+		}
+		target = strings.TrimSpace(string(raw))
+	}
+
+	args := []string{"capture-pane", "-p", "-t", target, "-S", fmt.Sprintf("-%d", lines)}
+	out, err := exec.CommandContext(ctx, "tmux", args...).Output()
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("tmux capture-pane failed: %v", err)), nil
+	}
+	return gomcp.NewToolResultText(string(out)), nil
+}
+
+// Niri compositor handlers
+
+func (s *Server) handleNiriAction(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	action, err := req.RequireString("action")
+	if err != nil {
+		return gomcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Parse actions with a numeric suffix: focus-workspace-1, move-window-to-workspace-2, etc.
+	var args []string
+	switch {
+	case strings.HasPrefix(action, "focus-workspace-"):
+		n := strings.TrimPrefix(action, "focus-workspace-")
+		args = []string{"msg", "action", "focus-workspace", n}
+	case strings.HasPrefix(action, "move-window-to-workspace-"):
+		n := strings.TrimPrefix(action, "move-window-to-workspace-")
+		args = []string{"msg", "action", "move-window-to-workspace", n}
+	default:
+		args = []string{"msg", "action", action}
+	}
+
+	out, err := exec.CommandContext(ctx, "niri", args...).CombinedOutput()
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("niri_action %q failed: %v: %s", action, err, strings.TrimSpace(string(out)))), nil
+	}
+	return gomcp.NewToolResultText(fmt.Sprintf("niri action %q executed", action)), nil
+}
+
+func (s *Server) handleSpawn(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	command, err := req.RequireString("command")
+	if err != nil {
+		return gomcp.NewToolResultError(err.Error()), nil
+	}
+
+	args := []string{"msg", "action", "spawn", "--", command}
+	out, err := exec.CommandContext(ctx, "niri", args...).CombinedOutput()
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("spawn %q failed: %v: %s", command, err, strings.TrimSpace(string(out)))), nil
+	}
+	return gomcp.NewToolResultText(fmt.Sprintf("spawned %q", command)), nil
+}
+
+// Tmux send/list handlers
+
+func (s *Server) handleTmuxSend(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	text := req.GetString("text", "")
+	keys := req.GetString("keys", "")
+	target := req.GetString("target", "")
+
+	if text == "" && keys == "" {
+		return gomcp.NewToolResultError("at least one of text or keys is required"), nil
+	}
+
+	var msgs []string
+
+	if text != "" {
+		args := []string{"send-keys", "-l"}
+		if target != "" {
+			args = append(args, "-t", target)
+		}
+		args = append(args, text)
+		out, err := exec.CommandContext(ctx, "tmux", args...).CombinedOutput()
+		if err != nil {
+			return gomcp.NewToolResultError(fmt.Sprintf("tmux send-keys text failed: %v: %s", err, out)), nil
+		}
+		msgs = append(msgs, fmt.Sprintf("sent text (%d chars)", len(text)))
+	}
+
+	if keys != "" {
+		args := []string{"send-keys"}
+		if target != "" {
+			args = append(args, "-t", target)
+		}
+		args = append(args, keys)
+		out, err := exec.CommandContext(ctx, "tmux", args...).CombinedOutput()
+		if err != nil {
+			return gomcp.NewToolResultError(fmt.Sprintf("tmux send-keys keys failed: %v: %s", err, out)), nil
+		}
+		msgs = append(msgs, fmt.Sprintf("sent keys %q", keys))
+	}
+
+	return gomcp.NewToolResultText(strings.Join(msgs, ", ")), nil
+}
+
+func (s *Server) handleTmuxList(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	format := "#{session_name}:#{window_index}.#{pane_index} #{pane_title} #{pane_current_command} #{pane_width}x#{pane_height}"
+	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F", format).Output()
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("tmux list-panes failed: %v", err)), nil
+	}
+	result := strings.TrimSpace(string(out))
+	if result == "" {
+		return gomcp.NewToolResultText("no tmux panes found"), nil
+	}
+	return gomcp.NewToolResultText(result), nil
+}
+
+// Screenshot handlers
+
+func (s *Server) handleScreenshot(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	scale := req.GetFloat("scale", 0.5)
+	cmd := exec.CommandContext(ctx, "grim", "-s", fmt.Sprintf("%.2f", scale), "-t", "png", "-l", "1", "-")
+	pngBytes, err := cmd.Output()
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("screenshot failed: %v", err)), nil
+	}
+	b64 := base64.StdEncoding.EncodeToString(pngBytes)
+	return gomcp.NewToolResultImage(
+		fmt.Sprintf("screenshot (scale=%.1f, %d bytes)", scale, len(pngBytes)),
+		b64,
+		"image/png",
+	), nil
+}
+
+func (s *Server) handleScreenshotRegion(ctx context.Context, req gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+	x := int(req.GetFloat("x", 0))
+	y := int(req.GetFloat("y", 0))
+	w := int(req.GetFloat("width", 0))
+	h := int(req.GetFloat("height", 0))
+	geom := fmt.Sprintf("%d,%d %dx%d", x, y, w, h)
+	cmd := exec.CommandContext(ctx, "grim", "-g", geom, "-t", "png", "-l", "1", "-")
+	pngBytes, err := cmd.Output()
+	if err != nil {
+		return gomcp.NewToolResultError(fmt.Sprintf("screenshot_region failed: %v", err)), nil
+	}
+	b64 := base64.StdEncoding.EncodeToString(pngBytes)
+	return gomcp.NewToolResultImage(
+		fmt.Sprintf("region (%s, %d bytes)", geom, len(pngBytes)),
+		b64,
+		"image/png",
+	), nil
 }
 
 // Utility handlers

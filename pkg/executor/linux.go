@@ -14,6 +14,7 @@ type LinuxExecutor struct {
 	mu             sync.Mutex
 	vkb            uinput.Keyboard
 	tp             uinput.TouchPad
+	mouse          uinput.Mouse
 	pressed        map[int]bool // keep track of down keys to reset them
 	buttonsPressed map[int]bool // keep track of down mouse buttons to reset them
 }
@@ -31,9 +32,17 @@ func NewLinuxExecutor(screenWidth, screenHeight int32) (*LinuxExecutor, error) {
 		return nil, fmt.Errorf("failed to create virtual touchpad: %w", err)
 	}
 
+	mouse, err := uinput.CreateMouse("/dev/uinput", []byte("Remoti Virtual Mouse"))
+	if err != nil {
+		tp.Close()
+		vkb.Close()
+		return nil, fmt.Errorf("failed to create virtual mouse: %w", err)
+	}
+
 	return &LinuxExecutor{
 		vkb:            vkb,
 		tp:             tp,
+		mouse:          mouse,
 		pressed:        make(map[int]bool),
 		buttonsPressed: make(map[int]bool),
 	}, nil
@@ -52,6 +61,9 @@ func (e *LinuxExecutor) Close() error {
 	}
 	if err := e.tp.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("touchpad close: %w", err))
+	}
+	if err := e.mouse.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("mouse close: %w", err))
 	}
 	return errors.Join(errs...)
 }
@@ -276,7 +288,22 @@ func (e *LinuxExecutor) MouseUp(button string) error {
 }
 
 func (e *LinuxExecutor) Scroll(dx, dy int32) error {
-	return fmt.Errorf("scroll not yet implemented: touchpad device does not support scroll events")
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// dy: positive = scroll down (wheel forward), negative = scroll up (wheel back)
+	if dy != 0 {
+		if err := e.mouse.Wheel(false, dy); err != nil {
+			return fmt.Errorf("scroll vertical: %w", err)
+		}
+	}
+	// dx: positive = scroll right, negative = scroll left
+	if dx != 0 {
+		if err := e.mouse.Wheel(true, dx); err != nil {
+			return fmt.Errorf("scroll horizontal: %w", err)
+		}
+	}
+	return nil
 }
 
 // Helper to parse key names into uinput key codes

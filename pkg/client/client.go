@@ -89,8 +89,23 @@ func (c *Client) Close() error {
 	return err
 }
 
+// reconnect re-establishes the TCP connection.
+func (c *Client) reconnect() error {
+	conn, err := net.Dial(c.opts.Network, c.addr)
+	if err != nil {
+		return fmt.Errorf("remoti: reconnect failed: %w", err)
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+	c.conn = conn
+	c.writer = bufio.NewWriterSize(conn, 4096)
+	return nil
+}
+
 // send writes a protocol line to the server.
 // It acquires the write mutex, writes the line + newline, and flushes.
+// Automatically reconnects on broken pipe.
 func (c *Client) send(line string) error {
 	if c.closed.Load() {
 		return fmt.Errorf("remoti: client is closed")
@@ -98,25 +113,53 @@ func (c *Client) send(line string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_, err := c.writer.WriteString(line + "\n")
-	if err != nil {
-		return fmt.Errorf("remoti: write failed: %w", err)
+	if err == nil {
+		err = c.writer.Flush()
 	}
-	return c.writer.Flush()
+	if err != nil {
+		// Try reconnect once
+		if reconErr := c.reconnect(); reconErr != nil {
+			return fmt.Errorf("remoti: write failed and reconnect failed: %w", err)
+		}
+		_, err = c.writer.WriteString(line + "\n")
+		if err == nil {
+			err = c.writer.Flush()
+		}
+		if err != nil {
+			return fmt.Errorf("remoti: write failed after reconnect: %w", err)
+		}
+	}
+	return nil
 }
 
 // sendBatch writes multiple protocol lines atomically (under one lock).
+// Automatically reconnects on broken pipe, then retries the entire batch.
 func (c *Client) sendBatch(lines []string) error {
 	if c.closed.Load() {
 		return fmt.Errorf("remoti: client is closed")
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	for _, line := range lines {
-		if _, err := c.writer.WriteString(line + "\n"); err != nil {
-			return fmt.Errorf("remoti: write failed: %w", err)
+
+	writeAll := func() error {
+		for _, line := range lines {
+			if _, err := c.writer.WriteString(line + "\n"); err != nil {
+				return err
+			}
+		}
+		return c.writer.Flush()
+	}
+
+	if err := writeAll(); err != nil {
+		// Try reconnect once, then retry the whole batch
+		if reconErr := c.reconnect(); reconErr != nil {
+			return fmt.Errorf("remoti: batch write failed and reconnect failed: %w", err)
+		}
+		if err := writeAll(); err != nil {
+			return fmt.Errorf("remoti: batch write failed after reconnect: %w", err)
 		}
 	}
-	return c.writer.Flush()
+	return nil
 }
 
 // Ping sends a no-op heartbeat to verify the connection is alive.
