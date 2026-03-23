@@ -161,12 +161,41 @@ func (s *Source) getRole(busName string, path dbus.ObjectPath) (sense.Role, erro
 
 func (s *Source) getExtents(busName string, path dbus.ObjectPath) (sense.Rect, error) {
 	obj := s.conn.Object(busName, path)
+	call := obj.Call(componentIface+".GetExtents", 0, coordTypeWindow)
+	if call.Err != nil {
+		return sense.Rect{}, call.Err
+	}
+	// GetExtents returns a struct (iiii) as a single body element
+	if len(call.Body) == 1 {
+		if slice, ok := call.Body[0].([]interface{}); ok && len(slice) == 4 {
+			x, _ := toInt32(slice[0])
+			y, _ := toInt32(slice[1])
+			w, _ := toInt32(slice[2])
+			h, _ := toInt32(slice[3])
+			return sense.Rect{X: x, Y: y, Width: w, Height: h}, nil
+		}
+	}
+	// Fallback: try direct store (some D-Bus impls return flat values)
 	var x, y, w, h int32
-	err := obj.Call(componentIface+".GetExtents", 0, coordTypeWindow).Store(&x, &y, &w, &h)
-	if err != nil {
+	if err := call.Store(&x, &y, &w, &h); err != nil {
 		return sense.Rect{}, err
 	}
 	return sense.Rect{X: x, Y: y, Width: w, Height: h}, nil
+}
+
+func toInt32(v interface{}) (int32, bool) {
+	switch n := v.(type) {
+	case int32:
+		return n, true
+	case int:
+		return int32(n), true
+	case int64:
+		return int32(n), true
+	case uint32:
+		return int32(n), true
+	default:
+		return 0, false
+	}
 }
 
 func (s *Source) walkTree(ctx context.Context, busName string, path dbus.ObjectPath, appName string, q sense.Query, matches *[]sense.Match, depth int) {
