@@ -7,12 +7,24 @@ CGO_ENABLED = "1"
 go = "1.26.1"
 
 [tasks.build]
-description = "Build the remoti server binary"
+description = "Build all binaries"
+run = "go build -o remoti ./cmd/remoti && go build -o remoti-mcp ./cmd/remoti-mcp"
+
+[tasks."build:server"]
+description = "Build the remoti input server"
 run = "go build -o remoti ./cmd/remoti"
 
+[tasks."build:mcp"]
+description = "Build the MCP server for Claude Code"
+run = "go build -o remoti-mcp ./cmd/remoti-mcp"
+
 [tasks.run]
-description = "Run the remoti server (requires root for uinput)"
+description = "Run the remoti input server (requires root for uinput)"
 run = "sudo ./remoti"
+
+[tasks."run:mcp"]
+description = "Run the MCP server (connects to remoti input server)"
+run = "./remoti-mcp"
 
 [tasks.test]
 description = "Run tests"
@@ -24,4 +36,4 @@ run = "go mod tidy"
 
 [tasks.clean]
 description = "Clean build artifacts"
-run = "rm -f remoti"
+run = "rm -f remoti remoti-mcp"

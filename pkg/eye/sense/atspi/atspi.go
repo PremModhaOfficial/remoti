@@ -111,18 +111,24 @@ type accessible struct {
 func (s *Source) getChildren(busName string, path dbus.ObjectPath) ([]accessible, error) {
 	obj := s.conn.Object(busName, path)
 
-	var count int32
-	err := obj.Call(accessibleIface+".GetChildCount", 0).Store(&count)
+	// ChildCount is a D-Bus PROPERTY, not a method
+	variant, err := obj.GetProperty(accessibleIface + ".ChildCount")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get ChildCount property: %w", err)
+	}
+	count, ok := variant.Value().(int32)
+	if !ok {
+		return nil, fmt.Errorf("ChildCount is not int32: %T", variant.Value())
 	}
 
 	var children []accessible
 	for i := int32(0); i < count; i++ {
-		var childBus string
-		var childPath dbus.ObjectPath
-		err := obj.Call(accessibleIface+".GetChildAtIndex", 0, i).Store(&childBus, &childPath)
-		if err != nil {
+		call := obj.Call(accessibleIface+".GetChildAtIndex", 0, i)
+		if call.Err != nil {
+			continue
+		}
+		childBus, childPath, ok := parseAccessibleRef(call.Body)
+		if !ok {
 			continue
 		}
 		children = append(children, accessible{busName: childBus, path: childPath})
@@ -230,6 +236,24 @@ func matchesQuery(name string, role sense.Role, q sense.Query) bool {
 	}
 
 	return true
+}
+
+// parseAccessibleRef extracts (busName, objectPath) from an AT-SPI D-Bus struct.
+// GetChildAtIndex returns a single struct (so) containing [busName, objectPath].
+func parseAccessibleRef(body []interface{}) (string, dbus.ObjectPath, bool) {
+	if len(body) != 1 {
+		return "", "", false
+	}
+	slice, ok := body[0].([]interface{})
+	if !ok || len(slice) != 2 {
+		return "", "", false
+	}
+	busName, ok1 := slice[0].(string)
+	pathStr, ok2 := slice[1].(dbus.ObjectPath)
+	if !ok1 || !ok2 {
+		return "", "", false
+	}
+	return busName, pathStr, true
 }
 
 // mapRole maps AT-SPI role IDs to sense.Role values.
