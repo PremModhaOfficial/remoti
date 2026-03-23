@@ -327,7 +327,6 @@ pub fn main() !void {
         sink +%= Grid1080p.hashSection(pix_a.ptr, 0);
     }
     const sec_hash3_ns = t0.read();
-    _ = sink;
 
     // --- Bench 6: single section hash (XxHash64) ---
     t0 = try std.time.Timer.start();
@@ -337,9 +336,8 @@ pub fn main() !void {
         sink2 +%= Grid1080p.hashSection64(pix_a.ptr, 0);
     }
     const sec_hash64_ns = t0.read();
-    _ = sink2;
 
     const sec_iters = iterations * 100;
-    try stdout.print("\nPer-section hash (XxHash3):  {d:.3}µs  [Go BenchmarkHashSection ~7µs]\n", .{ns_per(sec_hash3_ns, sec_iters)});
-    try stdout.print("Per-section hash (XxHash64): {d:.3}µs\n", .{ns_per(sec_hash64_ns, sec_iters)});
+    try stdout.print("\nPer-section hash (XxHash3):  {d:.3}µs  sink={d}  [Go BenchmarkHashSection ~7µs]\n", .{ ns_per(sec_hash3_ns, sec_iters), sink });
+    try stdout.print("Per-section hash (XxHash64): {d:.3}µs  sink={d}\n", .{ ns_per(sec_hash64_ns, sec_iters), sink2 });
 }

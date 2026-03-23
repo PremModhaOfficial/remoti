@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "remoti-eye": {
+      "command": "sudo",
+      "args": ["/home/prem-modha/projects/opens/remoti/remoti-mcp"],
+      "env": {
+        "REMOTI_ADDR": "127.0.0.1:8080"
+      }
+    }
+  }
+}
